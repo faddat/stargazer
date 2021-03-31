@@ -1,3 +1,5 @@
+rpc_node = "https://liquidity.app.beta.starport.cloud/"
+
 # thie config file is used by sql-migrate
 development:
   dialect: postgres

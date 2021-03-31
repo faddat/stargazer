@@ -1,6 +1,7 @@
 package workqueue
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -20,7 +21,10 @@ import (
 	"github.com/volatiletech/sqlboiler/v4/queries"
 
 	cryptocodec "github.com/cosmos/cosmos-sdk/crypto/codec"
+	cryptotypes "github.com/cosmos/cosmos-sdk/crypto/types"
 	sdk "github.com/cosmos/cosmos-sdk/types"
+	slashingtypes "github.com/cosmos/cosmos-sdk/x/slashing/types"
+	stakingtypes "github.com/cosmos/cosmos-sdk/x/staking/types"
 	"github.com/gofrs/uuid"
 	abcitypes "github.com/tendermint/tendermint/abci/types"
 	tmctypes "github.com/tendermint/tendermint/rpc/core/types"
@@ -65,7 +69,6 @@ func (w *Worker) Start(ctx context.Context) {
 			err := w.process(ctx, blockHeight)
 			if err != nil {
 				log.Error().Err(err).Int64("height", blockHeight).Msg("error processing block")
-
 				continue
 			}
 			log.Info().Int64("height", blockHeight).Msg("block synced")
@@ -73,10 +76,69 @@ func (w *Worker) Start(ctx context.Context) {
 	}
 }
 
+func (w *Worker) processGenesisBlock(ctx context.Context, height int64) error {
+	exists, err := models.BlockExists(ctx, w.db, height)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+	block, err := w.cp.Block(ctx, height)
+	if err != nil {
+		return fmt.Errorf("failed to fetch block: %w", err)
+	}
+
+	vals, err := w.cp.Validators(ctx, block.Block.LastCommit.GetHeight())
+	if err != nil {
+		return fmt.Errorf("failed to fetch validators for block: %w", err)
+	}
+	appValidators, err := w.appValidators(ctx, block.Block.LastCommit.GetHeight())
+	if err != nil {
+		log.Err(err).Msg("error retrieving app validators")
+	}
+	err = ExportBlockSignatures(ctx, block.Block.LastCommit, vals, appValidators, w.db)
+	if err != nil {
+		return fmt.Errorf("failed to export block signatures %w", err)
+	}
+	sl, err := models.FindSyncLog(ctx, w.db, height)
+	if err != nil {
+		return fmt.Errorf("error finding sync log: %w", err)
+	}
+	sl.Processed = true
+	sl.SyncedAt = null.NewTime(time.Now(), true)
+
+	_, err = sl.Update(ctx, w.db, boil.Infer())
+	return err
+}
+func (w *Worker) appValidators(ctx context.Context, height int64) (map[string]stakingtypes.Validator, error) {
+	appValidators, err := w.cp.AppValidators(ctx, height)
+	validators := make(map[string]stakingtypes.Validator)
+	if err != nil {
+		return validators, fmt.Errorf("failed to fetch app validators for block: %w", err)
+	}
+
+	for _, validator := range appValidators {
+		v := validator
+		err = w.cdc.UnpackAny(v.ConsensusPubkey, new(cryptotypes.PubKey))
+		if err != nil {
+			log.Err(err).Msg("failed to unpack val consensus pub key")
+			continue
+		}
+		consAddr, err := v.GetConsAddr()
+		if err != nil {
+			log.Err(err).Msg("failed retrieving cons addr")
+			continue
+		}
+		validators[consAddr.String()] = v
+	}
+
+	return validators, nil
+}
 func (w *Worker) process(ctx context.Context, height int64) error {
 	// skip genesis height
 	if height == w.genesisHeight {
-		return nil
+		return w.processGenesisBlock(ctx, height)
 	}
 	exists, err := models.BlockExists(ctx, w.db, height)
 	if err != nil {
@@ -108,8 +170,11 @@ func (w *Worker) process(ctx context.Context, height int64) error {
 	if err != nil {
 		return fmt.Errorf("failed to fetch validators for block: %w", err)
 	}
-
-	err = ExportBlockSignatures(ctx, block.Block.LastCommit, vals, w.db)
+	appValidators, err := w.appValidators(ctx, block.Block.LastCommit.GetHeight())
+	if err != nil {
+		log.Err(err).Msg("error retrieving app validators")
+	}
+	err = ExportBlockSignatures(ctx, block.Block.LastCommit, vals, appValidators, w.db)
 	if err != nil {
 		return fmt.Errorf("failed to export block signatures %w", err)
 	}
@@ -144,8 +209,42 @@ func (w *Worker) processBlockEvents(ctx context.Context, br *tmctypes.ResultBloc
 			}
 		}
 	}
-
+	for _, evt := range br.BeginBlockEvents {
+		switch evt.Type {
+		case slashingtypes.EventTypeLiveness:
+			err := handleLiveness(ctx, w.db, evt.Attributes, height)
+			if err != nil {
+				return err
+			}
+		case slashingtypes.EventTypeSlash:
+			err := handleSlash(ctx, w.db, evt.Attributes, height)
+			if err != nil {
+				return err
+			}
+		}
+	}
 	return nil
+}
+
+func (w *Worker) MarshalMsgs(msgs []sdk.Msg) ([]byte, error) {
+	resp := bytes.NewBuffer(make([]byte, 0))
+	resp.Write([]byte("["))
+	total := len(msgs)
+	for i, msg := range msgs {
+		msgBz, err := w.cdc.MarshalJSON(msg)
+		if err != nil {
+			return nil, err
+		}
+		_, err = resp.Write(msgBz)
+		if err != nil {
+			return nil, err
+		}
+		if i != total-1 {
+			resp.Write([]byte(","))
+		}
+	}
+	resp.Write([]byte("]"))
+	return resp.Bytes(), nil
 }
 
 // ExportBlock exports a block by processing it.
@@ -181,8 +280,7 @@ func (w *Worker) ExportBlock(ctx context.Context, b *tmctypes.ResultBlock, txs [
 		}
 
 		msgs := tx.GetMsgs()
-		msgsBz, err := json.Marshal(msgs)
-
+		msgsBz, err := w.MarshalMsgs(msgs)
 		if err != nil {
 			return fmt.Errorf("failed to JSON encode tx messages: %w", err)
 		}
@@ -333,6 +431,51 @@ func handleProtocolReward(ctx context.Context, db *sql.DB, attributes []abcitype
 	err = ur.Insert(ctx, db, boil.Infer())
 	if err != nil {
 		return fmt.Errorf("protocol_reward: error inserting upvote reward (%s) %w", postID, err)
+	}
+	return nil
+}
+func handleLiveness(ctx context.Context, db *sql.DB, attributes []abcitypes.EventAttribute, height int64) error {
+	attrs := parseEventAttributes(attributes)
+	if attrs[slashingtypes.AttributeKeyAddress] == "" || attrs[slashingtypes.AttributeKeyMissedBlocks] == "" {
+		return nil
+	}
+	addr := attrs[slashingtypes.AttributeKeyAddress]
+
+	blocksCounter, err := strconv.Atoi(attrs[slashingtypes.AttributeKeyMissedBlocks])
+	if err != nil {
+		log.Warn().Msg(fmt.Sprintf("can not parse block counter [%s] [%s]", addr, slashingtypes.AttributeKeyMissedBlocks))
+	}
+	se := &models.SlashingEvent{
+		Height:           height,
+		ValidatorAddress: addr,
+		EventType:        slashingtypes.EventTypeLiveness,
+		Counter:          int64(blocksCounter),
+	}
+	err = se.Insert(ctx, db, boil.Infer())
+	if err != nil {
+		return fmt.Errorf("slashing_event: error inserting liveness %s %w", addr, err)
+	}
+	return nil
+}
+
+func handleSlash(ctx context.Context, db *sql.DB, attributes []abcitypes.EventAttribute, height int64) error {
+	attrs := parseEventAttributes(attributes)
+	if attrs[slashingtypes.AttributeKeyAddress] == "" {
+		return nil
+	}
+	addr := attrs[slashingtypes.AttributeKeyAddress]
+	reason := attrs[slashingtypes.AttributeKeyReason]
+
+	se := &models.SlashingEvent{
+		Height:           height,
+		ValidatorAddress: addr,
+		EventType:        slashingtypes.EventTypeSlash,
+		Counter:          0,
+		Reason:           reason,
+	}
+	err := se.Insert(ctx, db, boil.Infer())
+	if err != nil {
+		return fmt.Errorf("slashing_event: error inserting liveness %s %w", addr, err)
 	}
 	return nil
 }
@@ -517,7 +660,7 @@ func sumGasTxs(txs []*sdk.TxResponse) uint64 {
 }
 
 // ExportBlockSignatures ...
-func ExportBlockSignatures(ctx context.Context, commit *tmtypes.Commit, validators *tmctypes.ResultValidators, db *sql.DB) error {
+func ExportBlockSignatures(ctx context.Context, commit *tmtypes.Commit, validators *tmctypes.ResultValidators, appValidators map[string]stakingtypes.Validator, db *sql.DB) error {
 	for _, sig := range commit.Signatures {
 		if sig.Signature == nil {
 			continue
@@ -527,7 +670,7 @@ func ExportBlockSignatures(ctx context.Context, commit *tmtypes.Commit, validato
 		if val == nil {
 			return fmt.Errorf("failed to find validator by address %s for block %d", addr, commit.GetHeight())
 		}
-		err := ExportValidator(ctx, val, db)
+		err := ExportValidator(ctx, val, appValidators, db)
 		if err != nil {
 			return fmt.Errorf("failed to export validator %w", err)
 		}
@@ -556,7 +699,7 @@ func SetBlockSignature(ctx context.Context, commit *tmtypes.Commit, sig tmtypes.
 }
 
 // ExportValidator exports validator
-func ExportValidator(ctx context.Context, val *tmtypes.Validator, db *sql.DB) error {
+func ExportValidator(ctx context.Context, val *tmtypes.Validator, appValidators map[string]stakingtypes.Validator, db *sql.DB) error {
 	address := sdk.ConsAddress(val.Address).String()
 	pk, err := cryptocodec.FromTmPubKeyInterface(val.PubKey)
 	if err != nil {
@@ -571,7 +714,12 @@ func ExportValidator(ctx context.Context, val *tmtypes.Validator, db *sql.DB) er
 		Address: address,
 		PubKey:  consPubKey,
 	}
-	return validator.Upsert(ctx, db, false, []string{}, boil.Columns{}, boil.Infer())
+	appValidator, ok := appValidators[address]
+	if ok {
+		validator.Moniker = appValidator.Description.Moniker
+		validator.OperatorAddress = appValidator.OperatorAddress
+	}
+	return validator.Upsert(ctx, db, true, []string{}, boil.Whitelist("operator_address", "moniker"), boil.Infer())
 }
 
 // findValidatorByAddr finds a validator by address given a set of
