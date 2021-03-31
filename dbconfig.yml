@@ -1,8 +1,0 @@
-rpc_node = "https://liquidity.app.beta.starport.cloud/"
-
-# thie config file is used by sql-migrate
-development:
-  dialect: postgres
-  datasource: sslmode=disable dbname=stargazer user=postgres password=postgres
-  dir: db/migrations/
-  table: migrations

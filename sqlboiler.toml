@@ -1,27 +1,22 @@
-[psql]
-  dbname = "stargazer"
-  host   = "localhost"
-  port   = 5432
-  user   = "postgres"
-  pass   = "postgres"
-  schema = "public"
-  sslmode= "disable"
-  blacklist = ["migrations"]
+[sqlite3]
+  dbname = "gaia.sqlite3"
 
-[[aliases.tables]]
-name = "block_signatures"
-  [[aliases.tables.relationships]]
-  name    = "block_signatures_validators_validator_address_fkey"
-  foreign = "Validator"
 
-[[aliases.tables]]
-name = "blocks"
-  [[aliases.tables.relationships]]
-  name    = "blocks_validators_proposer_address_fkey"
-  foreign = "Proposer"
 
-[[aliases.tables]]
-name = "transactions"
-  [[aliases.tables.relationships]]
-  name    = "transactions_blocks_height_fkey"
-  foreign = "Block"
+#[[aliases.tables]]
+#name = "block_signatures"
+#  [[aliases.tables.relationships]]
+#  name    = "block_signatures_validators_validator_address_fkey"
+#  foreign = "Validator"
+#
+#[[aliases.tables]]
+#name = "blocks"
+#  [[aliases.tables.relationships]]
+#  name    = "blocks_validators_proposer_address_fkey"
+#  foreign = "Proposer"
+#
+#[[aliases.tables]]
+#name = "transactions"
+#  [[aliases.tables.relationships]]
+#  name    = "transactions_blocks_height_fkey"
+#  foreign = "Block"

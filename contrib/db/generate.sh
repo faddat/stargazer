@@ -7,4 +7,4 @@ if [ "$VERSION" != "$REQUIRED_VERSION" ]; then
 fi
 
 
-sqlboiler psql  --struct-tag-casing camel  --wipe --no-hooks
+sqlboiler sqlite3  --struct-tag-casing camel  --wipe --no-hooks
